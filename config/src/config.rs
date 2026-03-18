@@ -816,6 +816,9 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub unzoom_on_switch_pane: bool,
 
+    #[dynamic(default)]
+    pub equalize_panes: bool,
+
     #[dynamic(default = "default_max_fps")]
     pub max_fps: u64,
 

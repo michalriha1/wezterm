@@ -478,6 +478,169 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
     }
 }
 
+/// Count the number of "leaf-columns" (horizontal) or "leaf-rows" (vertical)
+/// visible along the given direction. A different-direction split is opaque
+/// and counts as 1.
+fn count_leaves(tree: &Tree, direction: SplitDirection) -> usize {
+    match tree {
+        Tree::Empty => 0,
+        Tree::Leaf(_) => 1,
+        Tree::Node {
+            left,
+            right,
+            data: Some(data),
+        } => {
+            if data.direction == direction {
+                count_leaves(left, direction) + count_leaves(right, direction)
+            } else {
+                // Different direction = opaque scope boundary, counts as 1
+                1
+            }
+        }
+        Tree::Node { data: None, .. } => 1,
+    }
+}
+
+/// Set the size component (cols or rows) along the given direction on a TerminalSize,
+/// updating both the cell count and the corresponding pixel dimension.
+fn set_dim(size: &mut TerminalSize, direction: SplitDirection, value: usize, cell_dims: &TerminalSize) {
+    match direction {
+        SplitDirection::Horizontal => {
+            size.cols = value;
+            size.pixel_width = value * cell_dims.pixel_width;
+        }
+        SplitDirection::Vertical => {
+            size.rows = value;
+            size.pixel_height = value * cell_dims.pixel_height;
+        }
+    }
+}
+
+/// Recursive equalization with an optional budget.
+///
+/// `budget`: the total space (cols or rows, including internal separators)
+/// allocated for this subtree. `None` means compute from the node's own data
+/// (used at the top level). `Some(n)` is used when a parent has already
+/// determined the allocation (needed because child data may be stale after
+/// the parent was resized).
+fn equalize_impl(
+    tree: &mut Tree,
+    direction: SplitDirection,
+    budget: Option<usize>,
+    cell_dims: &TerminalSize,
+) {
+    match tree {
+        Tree::Empty | Tree::Leaf(_) => {}
+        Tree::Node {
+            left,
+            right,
+            data: Some(ref mut data),
+        } => {
+            if data.direction == direction {
+                // Same-direction scope root: compute global parameters and delegate
+                let budget = budget.unwrap_or_else(|| {
+                    if direction == SplitDirection::Horizontal {
+                        data.first.cols + 1 + data.second.cols
+                    } else {
+                        data.first.rows + 1 + data.second.rows
+                    }
+                });
+
+                let total_count = count_leaves(tree, direction);
+                if total_count == 0 {
+                    return;
+                }
+                let scope_usable = budget.saturating_sub(total_count - 1);
+                equalize_scope(tree, direction, scope_usable, total_count, 0, cell_dims);
+            } else {
+                // Different-direction node: scope boundary.
+                if let Some(budget) = budget {
+                    set_dim(&mut data.first, direction, budget, cell_dims);
+                    set_dim(&mut data.second, direction, budget, cell_dims);
+                }
+                // Recurse into children to equalize nested same-direction scopes.
+                equalize_impl(left, direction, budget, cell_dims);
+                equalize_impl(right, direction, budget, cell_dims);
+            }
+        }
+        Tree::Node { data: None, .. } => {}
+    }
+}
+
+/// Distribute space within a same-direction scope using global Bresenham
+/// distribution so that separators align across independent scopes with
+/// different leaf counts.
+///
+/// `scope_usable`: total cell space (excluding separators) for this scope.
+/// `scope_total`: total number of leaves in this scope.
+/// `leaf_offset`: index of the first leaf in this subtree within the scope.
+fn equalize_scope(
+    tree: &mut Tree,
+    direction: SplitDirection,
+    scope_usable: usize,
+    scope_total: usize,
+    leaf_offset: usize,
+    cell_dims: &TerminalSize,
+) {
+    match tree {
+        Tree::Empty | Tree::Leaf(_) => {}
+        Tree::Node {
+            left,
+            right,
+            data: Some(ref mut data),
+        } => {
+            if data.direction == direction {
+                let left_count = count_leaves(left, direction);
+                let right_count = count_leaves(right, direction);
+
+                // Bresenham: cells for leaves [leaf_offset .. leaf_offset + left_count)
+                let left_cells = (scope_usable * (leaf_offset + left_count)) / scope_total
+                    - (scope_usable * leaf_offset) / scope_total;
+                let left_seps = left_count.saturating_sub(1);
+                let left_budget = left_cells + left_seps;
+
+                let right_cells = (scope_usable * (leaf_offset + left_count + right_count))
+                    / scope_total
+                    - (scope_usable * (leaf_offset + left_count)) / scope_total;
+                let right_seps = right_count.saturating_sub(1);
+                let right_budget = right_cells + right_seps;
+
+                set_dim(&mut data.first, direction, left_budget, cell_dims);
+                set_dim(&mut data.second, direction, right_budget, cell_dims);
+
+                equalize_scope(
+                    left,
+                    direction,
+                    scope_usable,
+                    scope_total,
+                    leaf_offset,
+                    cell_dims,
+                );
+                equalize_scope(
+                    right,
+                    direction,
+                    scope_usable,
+                    scope_total,
+                    leaf_offset + left_count,
+                    cell_dims,
+                );
+            } else {
+                // Cross-direction node inside a scope: opaque, but propagate
+                // the budget along the equalize axis to its children.
+                // Cells for this single "opaque leaf" at position leaf_offset:
+                let cells = (scope_usable * (leaf_offset + 1)) / scope_total
+                    - (scope_usable * leaf_offset) / scope_total;
+                set_dim(&mut data.first, direction, cells, cell_dims);
+                set_dim(&mut data.second, direction, cells, cell_dims);
+                // Recurse to equalize nested same-direction scopes inside.
+                equalize_impl(left, direction, Some(cells), cell_dims);
+                equalize_impl(right, direction, Some(cells), cell_dims);
+            }
+        }
+        Tree::Node { data: None, .. } => {}
+    }
+}
+
 fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
     match tree {
         Tree::Empty => return,
@@ -718,6 +881,14 @@ impl Tab {
         self.inner
             .lock()
             .swap_active_with_index(pane_index, keep_focus)
+    }
+
+    /// Equalize pane sizes along the given direction.
+    /// Horizontal: equalizes column widths across horizontal splits.
+    /// Vertical: equalizes row heights across vertical splits.
+    /// Different-direction splits act as scope boundaries.
+    pub fn equalize_panes(&self, direction: SplitDirection) {
+        self.inner.lock().equalize_panes(direction)
     }
 
     /// Computes the size of the pane that would result if the specified
@@ -1175,6 +1346,15 @@ impl TabInner {
 
             self.size = size;
 
+            // If equalize_panes is enabled, equalize both directions before
+            // applying sizes so that panes stay equal after resize.
+            if configuration().equalize_panes {
+                if let Some(ref mut tree) = self.pane {
+                    equalize_impl(tree, SplitDirection::Horizontal, None, &dims);
+                    equalize_impl(tree, SplitDirection::Vertical, None, &dims);
+                }
+            }
+
             // And then resize the individual panes to match
             apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
         }
@@ -1606,6 +1786,8 @@ impl TabInner {
         F: Fn(usize, &Arc<dyn Pane>) -> bool,
     {
         let mut dead_panes = vec![];
+        let mut removed_horizontal = false;
+        let mut removed_vertical = false;
         let zoomed_pane = self.zoomed.as_ref().map(|p| p.pane_id());
 
         {
@@ -1641,6 +1823,10 @@ impl TabInner {
                             Ok((c, dead, p)) => {
                                 dead_panes.push(dead);
                                 parent = p.unwrap();
+                                match parent.direction {
+                                    SplitDirection::Horizontal => removed_horizontal = true,
+                                    SplitDirection::Vertical => removed_vertical = true,
+                                }
                                 cursor = c;
                             }
                             Err(c) => {
@@ -1694,6 +1880,15 @@ impl TabInner {
             let active_idx = self.active;
             removed_indices.retain(|&idx| idx <= active_idx);
             self.active = active_idx.saturating_sub(removed_indices.len());
+        }
+
+        if !dead_panes.is_empty() && configuration().equalize_panes {
+            if removed_horizontal {
+                self.equalize_panes(SplitDirection::Horizontal);
+            }
+            if removed_vertical {
+                self.equalize_panes(SplitDirection::Vertical);
+            }
         }
 
         if !dead_panes.is_empty() && kill {
@@ -1866,6 +2061,15 @@ impl TabInner {
         None
     }
 
+    fn equalize_panes(&mut self, direction: SplitDirection) {
+        let cell_dims = self.cell_dimensions();
+        let size = self.size;
+        if let Some(ref mut tree) = self.pane {
+            equalize_impl(tree, direction, None, &cell_dims);
+            apply_sizes_from_splits(tree, &size);
+        }
+    }
+
     fn compute_split_size(
         &mut self,
         pane_index: usize,
@@ -2036,6 +2240,11 @@ impl TabInner {
 
                         self.active = pane_index;
                         self.recency.tag(pane_index);
+
+                        if configuration().equalize_panes {
+                            self.equalize_panes(request.direction);
+                        }
+
                         return Ok(pane_index);
                     }
                     Err(cursor) => cursor,
@@ -2081,6 +2290,10 @@ impl TabInner {
                 self.active = pane_index + 1;
                 self.recency.tag(pane_index + 1);
             }
+        }
+
+        if configuration().equalize_panes {
+            self.equalize_panes(request.direction);
         }
 
         log::debug!("split info after split: {:#?}", self.iter_splits());
@@ -2200,6 +2413,7 @@ impl Into<String> for SerdeUrl {
 mod test {
     use super::*;
     use crate::renderable::*;
+    use config::Config;
     use parking_lot::{MappedMutexGuard, Mutex};
     use rangeset::RangeSet;
     use std::ops::Range;
@@ -2207,6 +2421,22 @@ mod test {
     use url::Url;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
+
+    /// Mutex to serialize tests that depend on global config state.
+    /// Tests that call `config::use_this_configuration` must hold this lock
+    /// for their entire duration to prevent interference from parallel tests.
+    /// Tests that don't mutate config but could be affected by it (e.g. they
+    /// call `do_split` which reads `configuration().equalize_panes`) must also
+    /// hold this lock.
+    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the config lock and reset to defaults. Returns the guard;
+    /// caller must keep it alive for the test's duration.
+    fn lock_config() -> std::sync::MutexGuard<'static, ()> {
+        let guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        config::use_this_configuration(Config::default_config());
+        guard
+    }
 
     struct FakePane {
         id: PaneId,
@@ -2628,4 +2858,1018 @@ mod test {
         assert_eq!(p2_height, pane2_after.height);
     }
 
+    // ==================== Equalize pane tests ====================
+
+    /// Helper: create a tab, assign initial pane, return (tab, size)
+    fn make_tab() -> (Tab, TerminalSize) {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        (tab, size)
+    }
+
+    /// Helper: split pane at index with default 50% size, returns new pane index
+    fn do_split(tab: &Tab, pane_index: usize, direction: SplitDirection, pane_id: PaneId) -> usize {
+        let request = SplitRequest {
+            direction,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::default(),
+        };
+        let split_size = tab.compute_split_size(pane_index, request).unwrap();
+        let new_pane_size = split_size.second;
+        tab.split_and_insert(pane_index, request, FakePane::new(pane_id, new_pane_size))
+            .unwrap()
+    }
+
+    /// Helper: find a pane by id in the positioned panes list
+    fn find_pane(panes: &[PositionedPane], pane_id: PaneId) -> &PositionedPane {
+        panes.iter().find(|p| p.pane.pane_id() == pane_id).unwrap()
+    }
+
+    // ---- Tests for standalone Tab::equalize_panes ----
+
+    /// A | B — two horizontal panes, equalize horizontal.
+    /// Both should get equal width.
+    #[test]
+    fn equalize_horizontal_two_panes() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        assert!((a.width as isize - b.width as isize).abs() <= 1,
+            "expected roughly equal widths, got A={} B={}", a.width, b.width);
+        assert_eq!(a.width + 1 + b.width, 120);
+        assert_eq!(a.height, 24);
+        assert_eq!(b.height, 24);
+    }
+
+    /// A | (B | C) — unbalanced horizontal tree.
+    /// Leaf-counting should give each pane ~1/3 of total width.
+    #[test]
+    fn equalize_horizontal_three_panes_unbalanced() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let expected = 118 / 3; // 120 - 2 separators = 118, / 3 ≈ 39
+        assert!((a.width as isize - expected as isize).abs() <= 1,
+            "A: expected ~{expected}, got {}", a.width);
+        assert!((b.width as isize - expected as isize).abs() <= 1,
+            "B: expected ~{expected}, got {}", b.width);
+        assert!((c.width as isize - expected as isize).abs() <= 1,
+            "C: expected ~{expected}, got {}", c.width);
+        assert_eq!(a.width + 1 + b.width + 1 + c.width, 120);
+    }
+
+    /// Balanced tree: (A|D)|(B|C), 4 panes each ~25% width.
+    #[test]
+    fn equalize_horizontal_four_panes_balanced() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+        do_split(&tab, 0, SplitDirection::Horizontal, 4);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let d = find_pane(&panes, 4);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let expected = 117 / 4; // 120 - 3 separators = 117, / 4 ≈ 29
+        for (name, pane) in [("A", a), ("D", d), ("B", b), ("C", c)] {
+            assert!((pane.width as isize - expected as isize).abs() <= 1,
+                "{name}: expected ~{expected}, got {}", pane.width);
+        }
+        assert_eq!(a.width + 1 + d.width + 1 + b.width + 1 + c.width, 120);
+    }
+
+    /// Mixed: A | (B / C). Horizontal equalize: V-split is opaque scope boundary.
+    /// A ≈ right side width; B and C share column.
+    #[test]
+    fn equalize_horizontal_mixed_h_then_v() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        assert!((a.width as isize - b.width as isize).abs() <= 1,
+            "A and B should be ~equal width: A={} B={}", a.width, b.width);
+        assert_eq!(b.width, c.width);
+    }
+
+    /// A | (B / (C | D)). Horizontal equalize:
+    ///   Root scope: A=1, V-split=1 => A≈50%, right≈50%
+    ///   Inner scope: C and D split right side equally
+    #[test]
+    fn equalize_horizontal_nested_h_inside_v() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+        do_split(&tab, 2, SplitDirection::Horizontal, 4);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let d = find_pane(&panes, 4);
+
+        assert!((a.width as isize - b.width as isize).abs() <= 1,
+            "A and B (full right col) should be ~equal: A={} B={}", a.width, b.width);
+        assert!((c.width as isize - d.width as isize).abs() <= 1,
+            "C and D should be ~equal: C={} D={}", c.width, d.width);
+        assert_eq!(b.width, c.width + 1 + d.width);
+    }
+
+    /// A / B — vertical equalize: equal heights.
+    #[test]
+    fn equalize_vertical_two_panes() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Vertical, 2);
+
+        tab.equalize_panes(SplitDirection::Vertical);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        assert!((a.height as isize - b.height as isize).abs() <= 1,
+            "expected roughly equal heights, got A={} B={}", a.height, b.height);
+        assert_eq!(a.height + 1 + b.height, 24);
+    }
+
+    /// Vertical equalize should not affect horizontal splits.
+    #[test]
+    fn equalize_vertical_does_not_affect_horizontal() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+
+        let panes_before = tab.iter_panes();
+        let a_w_before = find_pane(&panes_before, 1).width;
+        let b_w_before = find_pane(&panes_before, 2).width;
+
+        tab.equalize_panes(SplitDirection::Vertical);
+
+        let panes_after = tab.iter_panes();
+        let a_w_after = find_pane(&panes_after, 1).width;
+        let b_w_after = find_pane(&panes_after, 2).width;
+        assert_eq!(a_w_before, a_w_after);
+        assert_eq!(b_w_before, b_w_after);
+    }
+
+    /// Complex: A | (B / (D | E)) | C
+    /// Root scope: 3 leaf-columns (A, V-split opaque, C) => each ~1/3
+    /// Inner scope: D and E split the 1/3 column equally
+    #[test]
+    fn equalize_horizontal_complex_mixed() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+        do_split(&tab, 1, SplitDirection::Vertical, 4);
+        do_split(&tab, 2, SplitDirection::Horizontal, 5);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let d = find_pane(&panes, 4);
+        let e = find_pane(&panes, 5);
+
+        let third = 118 / 3;
+        assert!((a.width as isize - third as isize).abs() <= 1,
+            "A: expected ~{third}, got {}", a.width);
+        assert!((c.width as isize - third as isize).abs() <= 1,
+            "C: expected ~{third}, got {}", c.width);
+
+        let v_col_width = b.width;
+        assert!((v_col_width as isize - third as isize).abs() <= 2,
+            "V-split column: expected ~{third}, got {}", v_col_width);
+
+        assert!((d.width as isize - e.width as isize).abs() <= 1,
+            "D and E should be ~equal: D={} E={}", d.width, e.width);
+        assert_eq!(d.width + 1 + e.width, v_col_width,
+            "D + separator + E should equal V-split column width");
+    }
+
+    /// Same layout as equalize_horizontal_complex_mixed but equalize both directions:
+    ///   ┌────┬────┬────┐
+    ///   │    │ B  │    │
+    ///   │ A  ├──┬─┤ C  │
+    ///   │    │D │E│    │
+    ///   └────┴──┴─┴────┘
+    ///
+    /// Horizontal equalize: A=1/3, V-split=1/3, C=1/3; D≈E within V-split column.
+    /// Vertical equalize: B≈(D+E) row heights within V-split scope.
+    /// A and C keep full height (H-split is scope boundary for vertical).
+    #[test]
+    fn equalize_both_directions_complex_mixed() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+        do_split(&tab, 1, SplitDirection::Vertical, 4);
+        do_split(&tab, 2, SplitDirection::Horizontal, 5);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+        tab.equalize_panes(SplitDirection::Vertical);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let d = find_pane(&panes, 4);
+        let e = find_pane(&panes, 5);
+
+        // Horizontal: 3 leaf-columns
+        let third = 118 / 3;
+        assert!((a.width as isize - third as isize).abs() <= 1,
+            "A: expected ~{third}, got {}", a.width);
+        assert!((c.width as isize - third as isize).abs() <= 1,
+            "C: expected ~{third}, got {}", c.width);
+        let v_col_width = b.width;
+        assert!((v_col_width as isize - third as isize).abs() <= 2,
+            "V-split column: expected ~{third}, got {}", v_col_width);
+        assert!((d.width as isize - e.width as isize).abs() <= 1,
+            "D and E should be ~equal width: D={} E={}", d.width, e.width);
+        assert_eq!(d.width + 1 + e.width, v_col_width);
+
+        // Vertical: B and (D,E) row should be ~equal height within V-split
+        assert!((b.height as isize - d.height as isize).abs() <= 1,
+            "B and D should have ~equal height: B={} D={}", b.height, d.height);
+        assert_eq!(b.height + 1 + d.height, 24);
+        // D and E share the same row
+        assert_eq!(d.height, e.height);
+        // A and C span full height (not in any V-split scope)
+        assert_eq!(a.height, 24);
+        assert_eq!(c.height, 24);
+    }
+
+    // ---- Tests for mixed horizontal + vertical equalization ----
+
+    /// A | (B / C): vertical equalize should equalize B and C heights,
+    /// without touching the horizontal split widths.
+    #[test]
+    fn equalize_vertical_scoped_inside_horizontal() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        // A(1) | B(2)
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        // B(2) / C(3)
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+
+        let panes_before = tab.iter_panes();
+        let a_w_before = find_pane(&panes_before, 1).width;
+
+        tab.equalize_panes(SplitDirection::Vertical);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        // B and C should have equal heights
+        assert!((b.height as isize - c.height as isize).abs() <= 1,
+            "B and C should have ~equal heights: B={} C={}", b.height, c.height);
+        assert_eq!(b.height + 1 + c.height, 24);
+        // A's width should be unchanged
+        assert_eq!(a.width, a_w_before, "A's width should not change");
+        // A spans full height (no vertical split on its side)
+        assert_eq!(a.height, 24);
+    }
+
+    /// (A / B) | (C / D): equalize both directions to get a 2x2 grid.
+    /// Horizontal equalize: left column ≈ right column width.
+    /// Vertical equalize: A≈B height, C≈D height.
+    #[test]
+    fn equalize_both_directions_2x2_grid() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        // A(1) | C(2)
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        // A(1) / B(3)
+        do_split(&tab, 0, SplitDirection::Vertical, 3);
+        // C(2) / D(4)
+        do_split(&tab, 2, SplitDirection::Vertical, 4);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+        tab.equalize_panes(SplitDirection::Vertical);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 3);
+        let c = find_pane(&panes, 2);
+        let d = find_pane(&panes, 4);
+
+        // Horizontal: left column ≈ right column
+        assert!((a.width as isize - c.width as isize).abs() <= 1,
+            "left and right columns should be ~equal: left={} right={}", a.width, c.width);
+        // A and B share column width
+        assert_eq!(a.width, b.width);
+        // C and D share column width
+        assert_eq!(c.width, d.width);
+        // Vertical: top row ≈ bottom row
+        assert!((a.height as isize - b.height as isize).abs() <= 1,
+            "A and B should have ~equal height: A={} B={}", a.height, b.height);
+        assert!((c.height as isize - d.height as isize).abs() <= 1,
+            "C and D should have ~equal height: C={} D={}", c.height, d.height);
+        assert_eq!(a.width + 1 + c.width, 120);
+        assert_eq!(a.height + 1 + b.height, 24);
+    }
+
+    /// (A / B / C) | D: unbalanced vertical inside horizontal.
+    /// Vertical equalize should give A, B, C each ~1/3 height.
+    /// H-split is scope boundary for vertical — D keeps full height.
+    #[test]
+    fn equalize_vertical_three_rows_beside_single() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        // A(1) | D(2)
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        // A(1) / B(3)
+        do_split(&tab, 0, SplitDirection::Vertical, 3);
+        // B(3) / C(4)
+        do_split(&tab, 1, SplitDirection::Vertical, 4);
+
+        tab.equalize_panes(SplitDirection::Vertical);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 3);
+        let c = find_pane(&panes, 4);
+        let d = find_pane(&panes, 2);
+
+        // A, B, C should each be ~1/3 height: 24 - 2 separators = 22, / 3 ≈ 7
+        let expected = 22 / 3;
+        assert!((a.height as isize - expected as isize).abs() <= 1,
+            "A: expected ~{expected}, got {}", a.height);
+        assert!((b.height as isize - expected as isize).abs() <= 1,
+            "B: expected ~{expected}, got {}", b.height);
+        assert!((c.height as isize - expected as isize).abs() <= 1,
+            "C: expected ~{expected}, got {}", c.height);
+        assert_eq!(a.height + 1 + b.height + 1 + c.height, 24);
+        // D is full height — H-split is scope boundary for vertical
+        assert_eq!(d.height, 24);
+    }
+
+    /// A | (B / C) | D: horizontal equalize with V-split in the middle.
+    /// Root H-scope: A=1, V-split=1 (opaque), D=1 => each ~1/3 width.
+    /// Then vertical equalize: B≈C height within their scope.
+    #[test]
+    fn equalize_both_directions_v_split_in_middle() {
+        let _guard = lock_config();
+        let (tab, _) = make_tab();
+        // A(1) | B(2)
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        // B(2) | D(3)
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+        // B(2) / C(4)
+        do_split(&tab, 1, SplitDirection::Vertical, 4);
+
+        tab.equalize_panes(SplitDirection::Horizontal);
+        tab.equalize_panes(SplitDirection::Vertical);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 4);
+        let d = find_pane(&panes, 3);
+
+        // Horizontal: 3 leaf-columns => each ~1/3
+        let third = 118 / 3;
+        assert!((a.width as isize - third as isize).abs() <= 1,
+            "A: expected ~{third}, got {}", a.width);
+        assert!((d.width as isize - third as isize).abs() <= 1,
+            "D: expected ~{third}, got {}", d.width);
+        let v_col_width = b.width;
+        assert!((v_col_width as isize - third as isize).abs() <= 2,
+            "V-split column: expected ~{third}, got {}", v_col_width);
+        // B and C share column width
+        assert_eq!(b.width, c.width);
+        // Vertical: B and C equal height
+        assert!((b.height as isize - c.height as isize).abs() <= 1,
+            "B and C should have ~equal height: B={} C={}", b.height, c.height);
+        assert_eq!(b.height + 1 + c.height, 24);
+        // A and D are full height
+        assert_eq!(a.height, 24);
+        assert_eq!(d.height, 24);
+    }
+
+    /// Helper: create a tab with custom size, assign initial pane
+    fn make_tab_sized(cols: usize, rows: usize) -> Tab {
+        let size = TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 10,
+            pixel_height: rows * 25,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        tab
+    }
+
+    /// V-split: top row 4 H-panes, bottom row 2 H-panes.
+    /// The middle separator of the top row (between pane 2 and 3) should align
+    /// with the separator of the bottom row at various terminal widths.
+    #[test]
+    fn equalize_four_over_two_alignment() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        for cols in [43, 80, 100, 120, 133, 200, 237] {
+            let tab = make_tab_sized(cols, 24);
+            do_split(&tab, 0, SplitDirection::Vertical, 2);
+            do_split(&tab, 0, SplitDirection::Horizontal, 3);
+            do_split(&tab, 1, SplitDirection::Horizontal, 4);
+            do_split(&tab, 2, SplitDirection::Horizontal, 5);
+            do_split(&tab, 4, SplitDirection::Horizontal, 6);
+
+            let panes = tab.iter_panes();
+            let a = find_pane(&panes, 1);
+            let b = find_pane(&panes, 3);
+            let e = find_pane(&panes, 2);
+
+            let top_mid = a.left + a.width + 1 + b.width;
+            let bot_mid = e.left + e.width;
+            assert_eq!(top_mid, bot_mid,
+                "cols={cols}: Middle separator must align: top_mid={top_mid} bot_mid={bot_mid} (A={} B={} E={})",
+                a.width, b.width, e.width);
+        }
+    }
+
+    /// H-split: left column 2 V-panes, right column 4 V-panes.
+    /// The middle separator of the right column (between row 2 and 3) should align
+    /// with the separator of the left column at various terminal heights.
+    #[test]
+    fn equalize_two_beside_four_vertical_alignment() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        for rows in [24, 30, 40, 43, 50, 60, 73, 100] {
+            let tab = make_tab_sized(120, rows);
+            do_split(&tab, 0, SplitDirection::Horizontal, 2);
+            do_split(&tab, 0, SplitDirection::Vertical, 3);
+            do_split(&tab, 2, SplitDirection::Vertical, 4);
+            do_split(&tab, 3, SplitDirection::Vertical, 5);
+            do_split(&tab, 4, SplitDirection::Vertical, 6);
+
+            let panes = tab.iter_panes();
+            let a = find_pane(&panes, 1);
+            let rt = find_pane(&panes, 2);
+            let c = find_pane(&panes, 4);
+
+            let left_mid = a.top + a.height;
+            let right_mid = rt.top + rt.height + 1 + c.height;
+            assert_eq!(left_mid, right_mid,
+                "rows={rows}: Middle separator must align: left_mid={left_mid} right_mid={right_mid} (A={} RT={} C={})",
+                a.height, rt.height, c.height);
+        }
+    }
+
+    // ---- Tests for config-driven equalize on split ----
+
+    /// With config flag enabled, a normal horizontal split should auto-equalize.
+    /// A | B | C: all three get ~1/3 width.
+    #[test]
+    fn config_equalize_on_split_horizontal_three() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let expected = 118 / 3;
+        assert!((a.width as isize - expected as isize).abs() <= 1,
+            "A: expected ~{expected}, got {}", a.width);
+        assert!((b.width as isize - expected as isize).abs() <= 1,
+            "B: expected ~{expected}, got {}", b.width);
+        assert!((c.width as isize - expected as isize).abs() <= 1,
+            "C: expected ~{expected}, got {}", c.width);
+        assert_eq!(a.width + 1 + b.width + 1 + c.width, 120);
+    }
+
+    /// With config flag disabled, splits should NOT auto-equalize.
+    #[test]
+    fn config_equalize_disabled_no_auto_equalize() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = false;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let _c = find_pane(&panes, 3);
+        // Without equalize: A=59, B=29, C=30 (nested halving)
+        // A should be significantly wider than B and C
+        assert!(a.width > b.width + 10,
+            "Without equalize, A should be much wider: A={} B={}", a.width, b.width);
+    }
+
+    /// Config-driven equalize on split with mixed directions.
+    /// A | (B / C), then C split right => A | (B / (C | D)).
+    /// Only horizontal equalize fires (split direction is horizontal).
+    #[test]
+    fn config_equalize_on_split_mixed_directions() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+        do_split(&tab, 2, SplitDirection::Horizontal, 4);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let d = find_pane(&panes, 4);
+
+        // Root scope: A=1, V-split=1 => each ~50%
+        assert!((a.width as isize - b.width as isize).abs() <= 1,
+            "A and B should be ~equal width: A={} B={}", a.width, b.width);
+        // Inner scope: C and D equal
+        assert!((c.width as isize - d.width as isize).abs() <= 1,
+            "C and D should be ~equal: C={} D={}", c.width, d.width);
+    }
+
+    // ---- Tests for config-driven equalize on pane close ----
+
+    /// A | B | C, close C => A | B should equalize to ~50% each.
+    #[test]
+    fn config_equalize_on_close_horizontal_three_to_two() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        // After split with equalize: A≈B≈C≈39 cols each
+        // Now close C (pane_id=3)
+        tab.remove_pane(3);
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 2);
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        assert!((a.width as isize - b.width as isize).abs() <= 1,
+            "After closing C, A and B should be ~equal: A={} B={}", a.width, b.width);
+        assert_eq!(a.width + 1 + b.width, 120);
+    }
+
+    /// A | B | C, close B (middle pane) => A | C should equalize.
+    #[test]
+    fn config_equalize_on_close_middle_pane() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        // Close B (pane_id=2)
+        tab.remove_pane(2);
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 2);
+        let a = find_pane(&panes, 1);
+        let c = find_pane(&panes, 3);
+        assert!((a.width as isize - c.width as isize).abs() <= 1,
+            "After closing B, A and C should be ~equal: A={} C={}", a.width, c.width);
+        assert_eq!(a.width + 1 + c.width, 120);
+    }
+
+    /// A / B / C, close C => A / B should equalize heights.
+    #[test]
+    fn config_equalize_on_close_vertical() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Vertical, 2);
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+
+        tab.remove_pane(3);
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 2);
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        assert!((a.height as isize - b.height as isize).abs() <= 1,
+            "After closing C, A and B should be ~equal height: A={} B={}", a.height, b.height);
+        assert_eq!(a.height + 1 + b.height, 24);
+    }
+
+    /// A | (B / C), close B => A | C. Vertical pane closed, so vertical equalize fires.
+    /// Horizontal widths should be unchanged (only vertical direction equalizes).
+    #[test]
+    fn config_equalize_on_close_vertical_inside_horizontal() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+
+        let panes_before = tab.iter_panes();
+        let a_w_before = find_pane(&panes_before, 1).width;
+
+        // Close B (pane_id=2), parent split was vertical
+        tab.remove_pane(2);
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 2);
+        let a = find_pane(&panes, 1);
+        let c = find_pane(&panes, 3);
+        // A's width should be unchanged — only vertical equalize fired
+        assert_eq!(a.width, a_w_before,
+            "A's width should not change when a vertical pane is closed");
+        // C now takes full height of the right column
+        assert_eq!(c.height, 24);
+    }
+
+    /// With config flag disabled, closing a pane should NOT equalize.
+    #[test]
+    fn config_equalize_disabled_no_equalize_on_close() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = false;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        let panes_before = tab.iter_panes();
+        let a_w_before = find_pane(&panes_before, 1).width;
+
+        // Close C (pane_id=3)
+        tab.remove_pane(3);
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        // A's width should be unchanged — no equalize on close
+        assert_eq!(a.width, a_w_before,
+            "Without config flag, A's width should not change on close");
+    }
+
+    /// Complex: A | (B / (C | D)) | E. Close D => A | (B / C) | E.
+    /// Horizontal equalize fires (D's parent was H-split).
+    /// Root scope re-equalizes: A, V-split, E each ~1/3.
+    /// Inner H-scope (C was sibling) collapses — C takes full width of V-split column.
+    #[test]
+    fn config_equalize_on_close_nested_complex() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+        do_split(&tab, 1, SplitDirection::Vertical, 4);
+        do_split(&tab, 2, SplitDirection::Horizontal, 5);
+        // Layout: A | (B / (D(4) | E(5))) | C
+        // Pane indices: 0=A, 1=B, 2=D, 3=E, 4=C
+
+        // Close E (pane_id=5), parent was H-split
+        tab.remove_pane(5);
+
+        let panes = tab.iter_panes();
+        // Should have 4 panes left: A, B, D, C
+        assert_eq!(panes.len(), 4, "expected 4 panes after closing E");
+        let a = find_pane(&panes, 1);
+        let c = find_pane(&panes, 3);
+        // Root scope should still be roughly thirds (A, V-split, C)
+        let third = 118 / 3;
+        assert!((a.width as isize - third as isize).abs() <= 2,
+            "A: expected ~{third}, got {}", a.width);
+        assert!((c.width as isize - third as isize).abs() <= 2,
+            "C: expected ~{third}, got {}", c.width);
+    }
+
+    /// Close last remaining sibling: A | B, close B => only A remains, full width.
+    #[test]
+    fn config_equalize_on_close_to_single_pane() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+
+        tab.remove_pane(2);
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        let a = find_pane(&panes, 1);
+        assert_eq!(a.width, 120);
+        assert_eq!(a.height, 24);
+    }
+
+    // ---- Tests for config-driven equalize on window resize ----
+
+    /// If enabled, resizing the tab should equalize all horizontal scopes.
+    /// A | B | C with manual skew should return to ~thirds after resize.
+    #[test]
+    fn config_equalize_on_resize_horizontal_three() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        // Skew the root split so panes are intentionally uneven before resize.
+        tab.resize_split_by(0, 10);
+        let skewed = tab.iter_panes();
+        let a0 = find_pane(&skewed, 1);
+        let b0 = find_pane(&skewed, 2);
+        assert!(a0.width > b0.width + 5,
+            "precondition failed: expected skew before resize, got A={} B={}", a0.width, b0.width);
+
+        tab.resize(TerminalSize {
+            rows: 24,
+            cols: 150,
+            pixel_width: 1500,
+            pixel_height: 600,
+            dpi: 96,
+        });
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let expected = 148 / 3; // 150 cols - 2 separators
+        for (name, pane) in [("A", a), ("B", b), ("C", c)] {
+            assert!((pane.width as isize - expected as isize).abs() <= 1,
+                "{name}: expected ~{expected} after resize equalize, got {}", pane.width);
+        }
+        assert_eq!(a.width + 1 + b.width + 1 + c.width, 150);
+    }
+
+    /// If enabled, resizing the tab should equalize all vertical scopes.
+    /// A / B / C with manual skew should return to ~thirds after resize.
+    #[test]
+    fn config_equalize_on_resize_vertical_three() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Vertical, 2);
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+
+        // Skew the root split so panes are intentionally uneven before resize.
+        tab.resize_split_by(0, 4);
+        let skewed = tab.iter_panes();
+        let a0 = find_pane(&skewed, 1);
+        let b0 = find_pane(&skewed, 2);
+        assert!(a0.height > b0.height + 2,
+            "precondition failed: expected skew before resize, got A={} B={}", a0.height, b0.height);
+
+        tab.resize(TerminalSize {
+            rows: 36,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 900,
+            dpi: 96,
+        });
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let expected = 34 / 3; // 36 rows - 2 separators
+        for (name, pane) in [("A", a), ("B", b), ("C", c)] {
+            assert!((pane.height as isize - expected as isize).abs() <= 1,
+                "{name}: expected ~{expected} after resize equalize, got {}", pane.height);
+        }
+        assert_eq!(a.height + 1 + b.height + 1 + c.height, 36);
+    }
+
+    /// Mixed layout should equalize both axes on resize:
+    /// A | (B / C) with skewed splits should return to A≈right-column and B≈C heights.
+    #[test]
+    fn config_equalize_on_resize_mixed_directions() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Vertical, 3);
+
+        // Skew both root horizontal split and inner vertical split.
+        tab.resize_split_by(0, 15);
+        tab.resize_split_by(1, 4);
+
+        tab.resize(TerminalSize {
+            rows: 30,
+            cols: 150,
+            pixel_width: 1500,
+            pixel_height: 750,
+            dpi: 96,
+        });
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+
+        // A spans full height of the left column.
+        assert_eq!(a.height, 30);
+
+        // Horizontal scope: A and right column should be ~50/50.
+        assert!((a.width as isize - b.width as isize).abs() <= 1,
+            "A and right column should be ~equal width after resize equalize: A={} B={}", a.width, b.width);
+        assert_eq!(b.width, c.width);
+        assert_eq!(a.width + 1 + b.width, 150);
+
+        // Vertical scope inside right column: B and C should be ~equal height.
+        assert!((b.height as isize - c.height as isize).abs() <= 1,
+            "B and C should be ~equal height after resize equalize: B={} C={}", b.height, c.height);
+        assert_eq!(b.height + 1 + c.height, 30);
+    }
+
+    /// Shrinking the window should still equalize panes.
+    /// A | B | C at 120 cols, skewed, then shrink to 80 cols.
+    #[test]
+    fn config_equalize_on_resize_shrink_horizontal() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab(); // 120 cols
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        // Skew the root split.
+        tab.resize_split_by(0, 10);
+
+        tab.resize(TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        });
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+        let expected = 78 / 3; // 80 cols - 2 separators = 78, / 3 = 26
+        for (name, pane) in [("A", a), ("B", b), ("C", c)] {
+            assert!((pane.width as isize - expected as isize).abs() <= 1,
+                "{name}: expected ~{expected} after shrink equalize, got {}", pane.width);
+        }
+        assert_eq!(a.width + 1 + b.width + 1 + c.width, 80);
+    }
+
+    /// Resizing to the same dimensions should still equalize any prior skew.
+    /// A | B with manual skew, resize to same size => panes should be ~equal.
+    #[test]
+    fn config_equalize_on_resize_same_size() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = true;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab(); // 120 cols x 24 rows
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+
+        // Skew the split.
+        tab.resize_split_by(0, 15);
+        let skewed = tab.iter_panes();
+        let a0 = find_pane(&skewed, 1);
+        let b0 = find_pane(&skewed, 2);
+        assert!(a0.width > b0.width + 10,
+            "precondition failed: expected skew, got A={} B={}", a0.width, b0.width);
+
+        // Resize to the exact same dimensions.
+        tab.resize(TerminalSize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 600,
+            dpi: 96,
+        });
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        assert!((a.width as isize - b.width as isize).abs() <= 1,
+            "After same-size resize, A and B should be ~equal: A={} B={}", a.width, b.width);
+        assert_eq!(a.width + 1 + b.width, 120);
+    }
+
+    /// If disabled, resize should keep existing skew and not force equalization.
+    /// The default resize distributes extra space alternating left/right, preserving
+    /// the relative skew — A should remain significantly wider than B and C.
+    #[test]
+    fn config_equalize_disabled_no_auto_equalize_on_resize() {
+        let _guard = lock_config();
+        let mut config = Config::default_config();
+        config.equalize_panes = false;
+        config::use_this_configuration(config);
+
+        let (tab, _) = make_tab();
+        do_split(&tab, 0, SplitDirection::Horizontal, 2);
+        do_split(&tab, 1, SplitDirection::Horizontal, 3);
+
+        // Skew: make A significantly wider than B.
+        tab.resize_split_by(0, 10);
+        let before = tab.iter_panes();
+        let a_before = find_pane(&before, 1).width;
+        let b_before = find_pane(&before, 2).width;
+        let skew_before = a_before as isize - b_before as isize;
+        assert!(skew_before > 5,
+            "precondition failed: expected skew, got A={a_before} B={b_before}");
+
+        tab.resize(TerminalSize {
+            rows: 24,
+            cols: 150,
+            pixel_width: 1500,
+            pixel_height: 600,
+            dpi: 96,
+        });
+
+        let panes = tab.iter_panes();
+        let a = find_pane(&panes, 1);
+        let b = find_pane(&panes, 2);
+        let c = find_pane(&panes, 3);
+
+        // Without equalize, the skew should be preserved — A still much wider than B.
+        assert!(a.width > b.width + 5,
+            "with equalize disabled, skew should remain after resize: A={} B={}", a.width, b.width);
+        // Total must still be correct.
+        assert_eq!(a.width + 1 + b.width + 1 + c.width, 150);
+    }
+
 }
+
