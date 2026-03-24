@@ -595,7 +595,8 @@ impl Mux {
     /// Generate a new unique workspace name
     pub fn generate_workspace_name(&self) -> String {
         let used = self.iter_workspaces();
-        for candidate in names::Generator::default() {
+        for i in 1.. {
+            let candidate = format!("default #{i}");
             if !used.contains(&candidate) {
                 return candidate;
             }
