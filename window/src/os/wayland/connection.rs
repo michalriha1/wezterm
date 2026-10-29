@@ -74,6 +74,8 @@ impl WaylandConnection {
             Interest::READABLE,
         )?;
 
+        let mut waiting_for_write = false;
+
         while !*self.should_terminate.borrow() {
             let timeout = if SPAWN_QUEUE.run() {
                 Some(std::time::Duration::from_secs(0))
@@ -91,7 +93,27 @@ impl WaylandConnection {
                 }
             }
 
-            event_q.flush()?;
+            // The compositor may stop draining our socket for a while (eg: when
+            // a monitor is powered off), so a full send buffer is not fatal:
+            // wait for the socket to become writable and retry the flush.
+            let want_write = match event_q.flush() {
+                Ok(()) => false,
+                Err(WaylandError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    true
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if want_write != waiting_for_write {
+                let interest = if want_write {
+                    Interest::READABLE | Interest::WRITABLE
+                } else {
+                    Interest::READABLE
+                };
+                poll.registry()
+                    .reregister(&mut SourceFd(&wl_fd), tok_wl, interest)?;
+                waiting_for_write = want_write;
+            }
+
             if let Err(err) = poll.poll(&mut events, timeout) {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
@@ -100,7 +122,7 @@ impl WaylandConnection {
             }
 
             for event in &events {
-                if event.token() != tok_wl {
+                if event.token() != tok_wl || !event.is_readable() {
                     continue;
                 }
 
